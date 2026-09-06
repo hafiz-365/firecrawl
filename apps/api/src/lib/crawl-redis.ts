@@ -8,6 +8,11 @@ import { getAdjustedMaxDepth } from "../scraper/WebScraper/utils/maxDepthUtils";
 import type { Logger } from "winston";
 import { withSpan, setSpanAttributes } from "./otel-tracer";
 import { getScrapeZDR, getIgnoreRobots } from "./zdr-helpers";
+import {
+  firstPipelineError,
+  reportPipelineError,
+  REDIS_COMMAND_ARG_CHUNK_SIZE,
+} from "./redis-pipeline";
 
 export type StoredCrawl = {
   originUrl?: string;
@@ -167,7 +172,17 @@ export async function addCrawlJob(
     pipeline.expire("crawl:" + id + ":jobs", 24 * 60 * 60);
     pipeline.sadd("crawl:" + id + ":jobs_qualified", job_id);
     pipeline.expire("crawl:" + id + ":jobs_qualified", 24 * 60 * 60);
-    await pipeline.exec();
+    const error = reportPipelineError(await pipeline.exec(), __logger, {
+      module: "crawl-redis",
+      method: "addCrawlJob",
+      crawlId: id,
+      jobId: job_id,
+    });
+    if (error) {
+      throw new Error("Failed to add crawl job: " + error.message, {
+        cause: error,
+      });
+    }
   });
 }
 
@@ -185,11 +200,24 @@ export async function addCrawlJobs(
     crawlId: id,
   });
   const pipeline = redisEvictConnection.pipeline();
-  pipeline.sadd("crawl:" + id + ":jobs", ...job_ids);
+  for (let i = 0; i < job_ids.length; i += REDIS_COMMAND_ARG_CHUNK_SIZE) {
+    const chunk = job_ids.slice(i, i + REDIS_COMMAND_ARG_CHUNK_SIZE);
+    pipeline.sadd("crawl:" + id + ":jobs", ...chunk);
+    pipeline.sadd("crawl:" + id + ":jobs_qualified", ...chunk);
+  }
   pipeline.expire("crawl:" + id + ":jobs", 24 * 60 * 60);
-  pipeline.sadd("crawl:" + id + ":jobs_qualified", ...job_ids);
   pipeline.expire("crawl:" + id + ":jobs_qualified", 24 * 60 * 60);
-  await pipeline.exec();
+  const error = reportPipelineError(await pipeline.exec(), __logger, {
+    module: "crawl-redis",
+    method: "addCrawlJobs",
+    crawlId: id,
+    jobCount: job_ids.length,
+  });
+  if (error) {
+    throw new Error("Failed to add crawl jobs: " + error.message, {
+      cause: error,
+    });
+  }
 }
 
 export async function addCrawlJobDone(
@@ -204,19 +232,138 @@ export async function addCrawlJobDone(
     method: "addCrawlJobDone",
     crawlId: id,
   });
-  const pipeline = redisEvictConnection.pipeline();
-  pipeline.sadd("crawl:" + id + ":jobs_done", job_id);
-  pipeline.expire("crawl:" + id + ":jobs_done", 24 * 60 * 60);
+  // The commands are idempotent, so retry the whole pipeline on failure:
+  // callers invoke this on both the success and failure paths of a scrape
+  // job, and a throw from the success path would otherwise cascade into the
+  // failure path and misreport (and potentially re-run) a finished scrape.
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const pipeline = redisEvictConnection.pipeline();
+      pipeline.sadd("crawl:" + id + ":jobs_done", job_id);
+      pipeline.expire("crawl:" + id + ":jobs_done", 24 * 60 * 60);
 
-  if (success) {
-    pipeline.zadd("crawl:" + id + ":jobs_donez_ordered", Date.now(), job_id);
-  } else {
-    // in case it's already been pushed, make sure it's removed
-    pipeline.zrem("crawl:" + id + ":jobs_donez_ordered", job_id);
+      if (success) {
+        pipeline.zadd(
+          "crawl:" + id + ":jobs_donez_ordered",
+          Date.now(),
+          job_id,
+        );
+      } else {
+        // in case it's already been pushed, make sure it's removed
+        pipeline.zrem("crawl:" + id + ":jobs_donez_ordered", job_id);
+      }
+
+      pipeline.expire("crawl:" + id + ":jobs_donez_ordered", 24 * 60 * 60);
+      const error = firstPipelineError(await pipeline.exec());
+      if (error === null) {
+        return;
+      }
+      lastError = error;
+    } catch (error) {
+      lastError = error;
+    }
+
+    __logger.error("Redis pipeline command failed", {
+      module: "crawl-redis",
+      method: "addCrawlJobDone",
+      crawlId: id,
+      jobId: job_id,
+      attempt,
+      error: lastError,
+    });
+
+    if (attempt < 3) {
+      await new Promise(resolve => setTimeout(resolve, 50 * 2 ** attempt));
+    }
   }
 
-  pipeline.expire("crawl:" + id + ":jobs_donez_ordered", 24 * 60 * 60);
-  await pipeline.exec();
+  throw new Error("Failed to mark crawl job as done after retries", {
+    cause: lastError,
+  });
+}
+
+const CRAWL_JOB_DONE_REPAIR_KEY = "crawl-job-done-repair";
+const CRAWL_JOB_DONE_REPAIR_MAX = 10000;
+const CRAWL_JOB_DONE_REPAIR_BATCH = 100;
+
+type CrawlJobDoneRepairEntry = {
+  id: string;
+  job_id: string;
+  success: boolean;
+  at: number;
+};
+
+/// Best-effort durable record of a crawl completion marker that could not
+/// be written even after retries. Without it, an exhausted addCrawlJobDone
+/// leaves the crawl's done-set permanently short and the crawl never
+/// completes. Drained by repairCrawlJobDoneMarkers, which the NuQ
+/// reconciler worker runs every tick. Never throws.
+export async function queueCrawlJobDoneRepair(
+  id: string,
+  job_id: string,
+  success: boolean,
+  __logger: Logger = _logger,
+) {
+  const entry: CrawlJobDoneRepairEntry = {
+    id,
+    job_id,
+    success,
+    at: Date.now(),
+  };
+  try {
+    reportPipelineError(
+      await redisEvictConnection
+        .pipeline()
+        .lpush(CRAWL_JOB_DONE_REPAIR_KEY, JSON.stringify(entry))
+        .ltrim(CRAWL_JOB_DONE_REPAIR_KEY, 0, CRAWL_JOB_DONE_REPAIR_MAX - 1)
+        .exec(),
+      __logger,
+      {
+        module: "crawl-redis",
+        method: "queueCrawlJobDoneRepair",
+        crawlId: id,
+        jobId: job_id,
+      },
+    );
+  } catch (error) {
+    // Redis is fully down; nothing local can help further.
+    __logger.error("Failed to queue crawl completion repair", {
+      module: "crawl-redis",
+      method: "queueCrawlJobDoneRepair",
+      crawlId: id,
+      jobId: job_id,
+      error,
+    });
+  }
+}
+
+/// Re-attempts queued crawl completion markers, removing each from the
+/// repair list once it lands. Entries that keep failing stay queued for
+/// the next tick.
+export async function repairCrawlJobDoneMarkers(__logger: Logger = _logger) {
+  const raw = await redisEvictConnection.lrange(
+    CRAWL_JOB_DONE_REPAIR_KEY,
+    0,
+    CRAWL_JOB_DONE_REPAIR_BATCH - 1,
+  );
+
+  for (const entry of raw) {
+    let parsed: CrawlJobDoneRepairEntry;
+    try {
+      parsed = JSON.parse(entry);
+    } catch {
+      await redisEvictConnection.lrem(CRAWL_JOB_DONE_REPAIR_KEY, 1, entry);
+      continue;
+    }
+
+    try {
+      await addCrawlJobDone(parsed.id, parsed.job_id, parsed.success, __logger);
+      await redisEvictConnection.lrem(CRAWL_JOB_DONE_REPAIR_KEY, 1, entry);
+    } catch {
+      // Still failing — leave the entry queued for the next tick.
+    }
+  }
 }
 
 export async function getDoneJobsOrderedLength(
@@ -489,6 +636,7 @@ export async function lockURL(
   id: string,
   sc: StoredCrawl,
   url: string,
+  __logger: Logger = _logger,
 ): Promise<boolean> {
   return await withSpan("firecrawl-redis-lock-url", async span => {
     const normalizedUrl = normalizeURL(url, sc);
@@ -509,26 +657,108 @@ export async function lockURL(
       }
     }
 
-    const pipeline = redisEvictConnection.pipeline();
+    const lockTarget = !sc.crawlerOptions?.deduplicateSimilarURLs
+      ? normalizedUrl
+      : generateURLPermutations(normalizedUrl)[0].href;
 
-    if (!sc.crawlerOptions?.deduplicateSimilarURLs) {
-      pipeline.sadd("crawl:" + id + ":visited", normalizedUrl);
-    } else {
-      const permutation = generateURLPermutations(normalizedUrl)[0].href;
-      pipeline.sadd("crawl:" + id + ":visited", permutation);
+    // The commands are idempotent, so retry the pipeline on failure: the
+    // SADD may land before a failing command (e.g. a failed EXPIRE), and
+    // giving up then would leave the URL marked visited without being
+    // queued — a caller retry would read SADD=0 and skip it. Track whether
+    // any attempt reported the SADD as newly added, since a retry after a
+    // partial success reads 0.
+    let sawNewLock = false;
+    let locked = false;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let attemptError: unknown = null;
+      try {
+        const pipeline = redisEvictConnection.pipeline();
+        pipeline.sadd("crawl:" + id + ":visited", lockTarget);
+        pipeline.expire("crawl:" + id + ":visited", 24 * 60 * 60);
+        const attemptResults = await pipeline.exec();
+        if (attemptResults?.[0]?.[1] === 1) {
+          sawNewLock = true;
+        }
+        attemptError = firstPipelineError(attemptResults);
+      } catch (error) {
+        attemptError = error;
+      }
+
+      if (attemptError === null) {
+        locked = true;
+        lastError = null;
+        break;
+      }
+      lastError = attemptError;
+
+      __logger.error("Redis pipeline command failed", {
+        module: "crawl-redis",
+        method: "lockURL",
+        crawlId: id,
+        url: normalizedUrl,
+        attempt,
+        error: attemptError,
+      });
+
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 50 * 2 ** attempt));
+      }
     }
 
-    pipeline.expire("crawl:" + id + ":visited", 24 * 60 * 60);
+    if (!locked) {
+      throw new Error("URL lock pipeline failed after retries", {
+        cause: lastError,
+      });
+    }
 
-    const results = await pipeline.exec();
-    const saddResult = results?.[0]?.[1] as number;
-    const res = saddResult !== 0;
+    const res = sawNewLock;
 
     if (res) {
-      const uniquePipeline = redisEvictConnection.pipeline();
-      uniquePipeline.sadd("crawl:" + id + ":visited_unique", normalizedUrl);
-      uniquePipeline.expire("crawl:" + id + ":visited_unique", 24 * 60 * 60);
-      await uniquePipeline.exec();
+      // The visited SADD has already landed, so a caller retry would skip
+      // this URL as already-visited and it would be lost from the crawl.
+      // The visited_unique bookkeeping is idempotent — retry it before
+      // exposing the failure.
+      let lastError: unknown = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        let attemptError: unknown = null;
+        try {
+          const uniquePipeline = redisEvictConnection.pipeline();
+          uniquePipeline.sadd("crawl:" + id + ":visited_unique", normalizedUrl);
+          uniquePipeline.expire(
+            "crawl:" + id + ":visited_unique",
+            24 * 60 * 60,
+          );
+          attemptError = firstPipelineError(await uniquePipeline.exec());
+        } catch (error) {
+          attemptError = error;
+        }
+
+        if (attemptError === null) {
+          lastError = null;
+          break;
+        }
+        lastError = attemptError;
+
+        __logger.error("Redis pipeline command failed", {
+          module: "crawl-redis",
+          method: "lockURL",
+          crawlId: id,
+          url: normalizedUrl,
+          attempt,
+          error: attemptError,
+        });
+
+        if (attempt < 3) {
+          await new Promise(resolve => setTimeout(resolve, 50 * 2 ** attempt));
+        }
+      }
+
+      if (lastError !== null) {
+        throw new Error("Unique URL lock pipeline failed after retries", {
+          cause: lastError,
+        });
+      }
     }
 
     setSpanAttributes(span, { "crawl.url_locked": res });
@@ -556,27 +786,89 @@ export async function lockURLs(
   // Add to visited_unique set
   logger.debug("Locking " + urls.length + " URLs...");
 
-  const pipeline = redisEvictConnection.pipeline();
-  pipeline.sadd("crawl:" + id + ":visited_unique", ...urls);
-  pipeline.expire("crawl:" + id + ":visited_unique", 24 * 60 * 60);
-
-  if (!sc.crawlerOptions?.deduplicateSimilarURLs) {
-    pipeline.sadd("crawl:" + id + ":visited", ...urls);
-  } else {
-    const allPermutations = urls.map(
-      url => generateURLPermutations(url)[0].href,
-    );
-    logger.debug("Adding " + allPermutations.length + " URL permutations...");
-    pipeline.sadd("crawl:" + id + ":visited", ...allPermutations);
+  const visitedUrls = !sc.crawlerOptions?.deduplicateSimilarURLs
+    ? urls
+    : urls.map(url => generateURLPermutations(url)[0].href);
+  if (sc.crawlerOptions?.deduplicateSimilarURLs) {
+    logger.debug("Adding URL permutations...", { count: visitedUrls.length });
   }
 
-  pipeline.expire("crawl:" + id + ":visited", 24 * 60 * 60);
+  // The commands are idempotent, so retry the pipeline on failure: an
+  // early chunk may land before a later one fails, and giving up then
+  // leaves those URLs marked visited without being queued — a caller retry
+  // would read them as already locked and skip them.
+  let results: [Error | null, unknown][] | null = null;
+  let visitedChunkStartIndexes: number[] = [];
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let attemptError: unknown = null;
+    try {
+      const pipeline = redisEvictConnection.pipeline();
+      for (let i = 0; i < urls.length; i += REDIS_COMMAND_ARG_CHUNK_SIZE) {
+        pipeline.sadd(
+          "crawl:" + id + ":visited_unique",
+          ...urls.slice(i, i + REDIS_COMMAND_ARG_CHUNK_SIZE),
+        );
+      }
+      pipeline.expire("crawl:" + id + ":visited_unique", 24 * 60 * 60);
 
-  const results = await pipeline.exec();
-  const saddResult = results?.[2]?.[1] as number;
+      visitedChunkStartIndexes = [];
+      for (
+        let i = 0;
+        i < visitedUrls.length;
+        i += REDIS_COMMAND_ARG_CHUNK_SIZE
+      ) {
+        visitedChunkStartIndexes.push(pipeline.length);
+        pipeline.sadd(
+          "crawl:" + id + ":visited",
+          ...visitedUrls.slice(i, i + REDIS_COMMAND_ARG_CHUNK_SIZE),
+        );
+      }
+
+      pipeline.expire("crawl:" + id + ":visited", 24 * 60 * 60);
+
+      const attemptResults = await pipeline.exec();
+      attemptError = firstPipelineError(attemptResults);
+      if (attemptError === null) {
+        results = attemptResults;
+      }
+    } catch (error) {
+      attemptError = error;
+    }
+
+    if (attemptError === null) {
+      lastError = null;
+      break;
+    }
+    lastError = attemptError;
+
+    logger.error("Redis pipeline command failed", {
+      urlCount: urls.length,
+      attempt,
+      error: attemptError,
+    });
+
+    if (attempt < 3) {
+      await new Promise(resolve => setTimeout(resolve, 50 * 2 ** attempt));
+    }
+  }
+
+  if (results === null) {
+    throw new Error("Failed to lock URLs after retries", {
+      cause: lastError,
+    });
+  }
+
+  // If an earlier attempt partially landed, the clean attempt's SADD counts
+  // under-report (members already present), so res can be false even though
+  // every URL is locked. Callers only use this for logging.
+  const saddResult = visitedChunkStartIndexes.reduce(
+    (total, index) => total + ((results?.[index]?.[1] as number) ?? 0),
+    0,
+  );
   const res = saddResult === urls.length;
 
-  logger.debug("lockURLs final result: " + res, { res });
+  logger.debug("lockURLs final result", { res });
   return res;
 }
 
