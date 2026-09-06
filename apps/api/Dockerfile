@@ -55,7 +55,9 @@ COPY native ./native
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/native/target \
-    pnpm install --frozen-lockfile
+    pnpm install --frozen-lockfile && \
+    pnpm rebuild foundationdb && \
+    pnpm --filter @mendable/firecrawl-rs build
 
 COPY . .
 

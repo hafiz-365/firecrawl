@@ -59,7 +59,8 @@ overrides:
 patchedDependencies:
   "node-fetch@2.7.0": "patches/node-fetch@2.7.0.patch"
 allowBuilds:
-  "@mendable/firecrawl-rs": true
+  # The v0 installer does not provide cargo; Docker rebuilds this package explicitly.
+  "@mendable/firecrawl-rs": false
   "@sentry-internal/node-cpu-profiler": true
   "@sentry/cli": true
   bigint-buffer: true
@@ -69,7 +70,9 @@ allowBuilds:
   sse4_crc32: false
   bufferutil: true
   esbuild: true
-  foundationdb: true
+  # The v0 dependency installer does not provide FoundationDB headers.
+  # Production Docker builds explicitly rebuild it after installing the client package.
+  foundationdb: false
   four-flap-bigint-buffer: true
   keccak: true
   koffi: true
